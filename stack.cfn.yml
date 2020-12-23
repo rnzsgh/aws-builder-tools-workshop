@@ -1,0 +1,584 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: AWS Developer Tools Workshop
+
+Parameters:
+
+  CodeBuildContainerImage:
+    Type: String
+    Description: CodeBuild container image
+    Default: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+
+  SeedContainerImage:
+    Type: String
+    Description: Seed container image
+    Default: public.ecr.aws/q5l2x5i4/aws-builder-tools-workshop:latest
+
+  SubnetId0:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet id 0 for Fargate service
+
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet id 1 for Fargate service
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC id for Fargate service
+
+
+Resources:
+
+  # CodeGuru ###################################################################
+
+  CodeGuruReviewer:
+    Type: AWS::CodeGuruReviewer::RepositoryAssociation
+    Properties:
+      Name: !GetAtt CodeCommitRepository.Name
+      Type: CodeCommit
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+            #  CodeGuruProfiler:
+            #    Type: AWS::CodeGuruProfiler::ProfilingGroup
+            #    Properties:
+            #      ComputePlatform: Default
+
+  # CodeCommit #################################################################
+
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      Code:
+        BranchName: master
+        S3:
+          Bucket: pub-cfn-cust-res-pocs-us-east-1
+          Key: aws-builder-tools-sample-app.zip
+      RepositoryName: !Sub aws-dev-tools-${AWS::StackName}
+      RepositoryDescription: AWS Developer Tools Workshop
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  # S3 #########################################################################
+
+  CodePipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  # CodePipeline ###############################################################
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              Configuration:
+                RepositoryName: !GetAtt CodeCommitRepository.Name
+                BranchName: master
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: App
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: ECS
+              Configuration:
+                ClusterName: !Ref FargateEcsCluster
+                ServiceName: !GetAtt FargateService.Name
+                FileName: build.json
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  # CodeBuild ##################################################################
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub
+          - |
+            ---
+            version: 0.2
+            phases:
+              install:
+                runtime-versions:
+                  docker: 20
+              pre_build:
+                  commands:
+                  - TAG="$(date +%Y-%m-%d.%H.%M.%S).$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
+                  - $(aws ecr get-login --no-include-email)
+                  - aws codeartifact login --tool pip --domain $ARTIFACT_DOMAIN --repository $ARTIFACT_REPO
+              build:
+                commands:
+                  - docker build --tag $REPOSITORY_URI:$TAG .
+              post_build:
+                commands:
+                  - docker push $REPOSITORY_URI:$TAG
+                  - printf '[{"name":"${ServiceName}","imageUri":"%s"}]' $REPOSITORY_URI:$TAG > build.json
+            artifacts:
+              files: build.json
+          - ServiceName: !Ref AWS::StackName
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: !Ref CodeBuildContainerImage
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}
+          - Name: ARTIFACT_DOMAIN
+            Value: !GetAtt CodeArtifactRepository.DomainName
+          - Name: ARTIFACT_REPO
+            Value: !GetAtt CodeArtifactRepository.Name
+
+
+      Name: !Ref AWS::StackName
+      ServiceRole: !Ref CodeBuildServiceRole
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  # CodeArtifact ###############################################################
+
+  CodeArtifactDomain:
+    Type: AWS::CodeArtifact::Domain
+    Properties:
+      DomainName: !Ref AWS::StackName
+      EncryptionKey: alias/aws/codeartifact
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+
+  CodeArtifactPyPiRepository:
+    Type: AWS::CodeArtifact::Repository
+    Properties:
+      RepositoryName: pypi-store
+      Description: Provides PyPI artifacts from PyPA
+      DomainName: !GetAtt CodeArtifactDomain.Name
+      DomainOwner: !Ref AWS::AccountId
+      ExternalConnections:
+        - public:pypi
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  CodeArtifactRepository:
+    Type: AWS::CodeArtifact::Repository
+    Properties:
+      RepositoryName: !Ref AWS::StackName
+      DomainName: !GetAtt CodeArtifactDomain.Name
+      DomainOwner: !Ref AWS::AccountId
+      Upstreams:
+        - pypi-store
+      Tags:
+        - Key: AppCode
+          Value: workshop
+    DependsOn: CodeArtifactPyPiRepository
+
+  # IAM ########################################################################
+
+  EcsServiceLinkedRole:
+    Type: AWS::IAM::ServiceLinkedRole
+    DeletionPolicy: Retain
+    Properties:
+      AWSServiceName: ecs.amazonaws.com
+      Description: Role to enable Amazon ECS to manage your cluster.
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codepipeline-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - ecs:List*
+                  - ecs:Describe*
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                  - iam:PassRole
+              - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codebuild-container
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:GetAuthorizationToken
+              - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+              - Resource: !GetAtt EcrRepository.Arn
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+              - Resource: !GetAtt CodeArtifactRepository.Arn
+                Effect: Allow
+                Action:
+                  - codeartifact:GetAuthorizationToken
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  FargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  FargateTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  # ECR ########################################################################
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageScanningConfiguration:
+        scanOnPush: true
+      LifecyclePolicy:
+         LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Only keep last 20 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  # ECS ########################################################################
+
+  FargateEcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Base: 1
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: AppCode
+          Value: workshop
+    DependsOn: EcsServiceLinkedRole
+
+  FargateService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref AWS::StackName
+      Cluster: !Ref FargateEcsCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref FargateTaskDefinition
+      LoadBalancers:
+        - ContainerName: !Ref AWS::StackName
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !GetAtt FargateServiceSecurityGroup.GroupId
+          Subnets:
+            - !Ref SubnetId0
+            - !Ref SubnetId1
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  FargateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref AWS::StackName
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      TaskRoleArn: !GetAtt FargateTaskRole.Arn
+      ExecutionRoleArn: !GetAtt FargateTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref AWS::StackName
+          Image: !Ref SeedContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref FargateLogGroup
+              awslogs-stream-prefix: app
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  # Load Balancer ##############################################################
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !Ref SubnetId0
+        - !Ref SubnetId1
+      SecurityGroups:
+        - !GetAtt AlbSecurityGroup.GroupId
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8080
+      Protocol: HTTP
+      Matcher:
+        HttpCode: 200
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: 60
+      TargetType: ip
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  # CloudWatch Logs ############################################################
+
+  FargateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AWS::StackName}/service
+
+  # EC2 ########################################################################
+
+  FargateServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: Service SG
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref AlbSecurityGroup
+          IpProtocol: tcp
+          ToPort: 8080
+          FromPort: 8080
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: ALB SG
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          ToPort: 80
+          FromPort: 80
+      Tags:
+        - Key: AppCode
+          Value: workshop
+
+  AlbSecurityGroupToFargateServiceEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      ToPort: 8080
+      FromPort: 8080
+      DestinationSecurityGroupId: !Ref FargateServiceSecurityGroup
+
+
+Outputs:
+
+  Name:
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub ${AWS::StackName}-Name
+
+  CodeArtifactRepositoryArn:
+    Value: !GetAtt CodeArtifactRepository.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CodeArtifactRepositoryArn
+
+  CodeArtifactRepositoryName:
+    Value: !GetAtt CodeArtifactRepository.Name
+    Export:
+      Name: !Sub ${AWS::StackName}-CodeArtifactRepositoryName
+
+  CodeArtifactRepositoryDomainName:
+    Value: !GetAtt CodeArtifactRepository.DomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-CodeArtifactRepositoryDomainName
+
+  ApplicationLoadBalancerArn:
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub ${AWS::StackName}-ApplicationLoadBalancerArn
+
+  ApplicationLoadBalancerDnsName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-ApplicationLoadBalancerDnsName
+
+  ApplicationLoadBalancerBaseDnsName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-ApplicationLoadBalancerBaseDnsName
+
+  ApplicationLoadBalancerCanonicalHostedZoneId:
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub ${AWS::StackName}-ApplicationLoadBalancerCanonicalHostedZoneId
+
+  ApplicationLoadBalancerName:
+    Value: !GetAtt ApplicationLoadBalancer.LoadBalancerName
+    Export:
+      Name: !Sub ${AWS::StackName}-ApplicationLoadBalancerName
+

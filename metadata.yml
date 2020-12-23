@@ -1,0 +1,30 @@
+
+name: aws-developer-tools
+
+title: AWS Developer Tools
+
+description: A quick introduction to developer tools on AWS
+
+categories:
+  - AWS
+  - CI/CD
+  - DevOps
+
+services:
+   - AWS CodeBuild
+   - AWS CodeCommit
+   - AWS CodePipeline
+   - AWS CodeArtifact
+   - Amazon CodeGuru
+
+level: 100
+
+duration: 90
+
+cost: 0
+
+author: RN
+
+audience:
+  - IT Professional
+  - Developer
