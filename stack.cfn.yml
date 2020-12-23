@@ -145,12 +145,16 @@ Resources:
             phases:
               install:
                 runtime-versions:
-                  docker: 20
+                  docker: 19
+                  python: 3.x
               pre_build:
                   commands:
                   - TAG="$(date +%Y-%m-%d.%H.%M.%S).$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
                   - $(aws ecr get-login --no-include-email)
                   - aws codeartifact login --tool pip --domain $ARTIFACT_DOMAIN --repository $ARTIFACT_REPO
+                  - mkdir libs
+                  - pip install --target ./ --no-cache-dir -r requirements.txt
+                  - ls -la
               build:
                 commands:
                   - docker build --tag $REPOSITORY_URI:$TAG .
@@ -165,6 +169,7 @@ Resources:
         ComputeType: BUILD_GENERAL1_SMALL
         Type: LINUX_CONTAINER
         Image: !Ref CodeBuildContainerImage
+        PrivilegedMode: true
         EnvironmentVariables:
           - Name: REPOSITORY_URI
             Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}
@@ -172,8 +177,6 @@ Resources:
             Value: !GetAtt CodeArtifactRepository.DomainName
           - Name: ARTIFACT_REPO
             Value: !GetAtt CodeArtifactRepository.Name
-
-
       Name: !Ref AWS::StackName
       ServiceRole: !Ref CodeBuildServiceRole
       Tags:
@@ -187,10 +190,22 @@ Resources:
     Properties:
       DomainName: !Ref AWS::StackName
       EncryptionKey: alias/aws/codeartifact
+      PermissionsPolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Resource: '*'
+            Action:
+              - codeartifact:CreateRepository
+              - codeartifact:DescribeDomain
+              - codeartifact:GetAuthorizationToken
+              - codeartifact:GetDomainPermissionsPolicy
+              - codeartifact:ListRepositoriesInDomain
       Tags:
         - Key: AppCode
           Value: workshop
-
 
   CodeArtifactPyPiRepository:
     Type: AWS::CodeArtifact::Repository
@@ -201,6 +216,25 @@ Resources:
       DomainOwner: !Ref AWS::AccountId
       ExternalConnections:
         - public:pypi
+      PermissionsPolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Resource: '*'
+            Action:
+              - codeartifact:DescribePackageVersion
+              - codeartifact:DescribeRepository
+              - codeartifact:GetPackageVersionReadme
+              - codeartifact:GetRepositoryEndpoint
+              - codeartifact:ListPackageVersionAssets
+              - codeartifact:ListPackageVersionDependencies
+              - codeartifact:ListPackageVersions
+              - codeartifact:ListPackages
+              - codeartifact:PublishPackageVersion
+              - codeartifact:PutPackageMetadata
+              - codeartifact:ReadFromRepository
       Tags:
         - Key: AppCode
           Value: workshop
@@ -212,11 +246,29 @@ Resources:
       DomainName: !GetAtt CodeArtifactDomain.Name
       DomainOwner: !Ref AWS::AccountId
       Upstreams:
-        - pypi-store
+        - !GetAtt CodeArtifactPyPiRepository.Name
+      PermissionsPolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Resource: '*'
+            Action:
+              - codeartifact:DescribePackageVersion
+              - codeartifact:DescribeRepository
+              - codeartifact:GetPackageVersionReadme
+              - codeartifact:GetRepositoryEndpoint
+              - codeartifact:ListPackageVersionAssets
+              - codeartifact:ListPackageVersionDependencies
+              - codeartifact:ListPackageVersions
+              - codeartifact:ListPackages
+              - codeartifact:PublishPackageVersion
+              - codeartifact:PutPackageMetadata
+              - codeartifact:ReadFromRepository
       Tags:
         - Key: AppCode
           Value: workshop
-    DependsOn: CodeArtifactPyPiRepository
 
   # IAM ########################################################################
 
@@ -305,10 +357,22 @@ Resources:
                   - ecr:InitiateLayerUpload
                   - ecr:UploadLayerPart
                   - ecr:CompleteLayerUpload
+              - Resource: !GetAtt CodeArtifactDomain.Arn
+                Effect: Allow
+                Action: codeartifact:GetAuthorizationToken
               - Resource: !GetAtt CodeArtifactRepository.Arn
                 Effect: Allow
                 Action:
-                  - codeartifact:GetAuthorizationToken
+                  - codeartifact:ReadFromRepository
+                  - codeartifact:GetRepositoryEndpoint
+              - Resource: '*'
+                Effect: Allow
+                Action: sts:GetServiceBearerToken
+                Condition:
+                  StringEquals:
+                    sts:AWSServiceName: codeartifact.amazonaws.com
+
+
       Tags:
         - Key: AppCode
           Value: workshop
@@ -566,11 +630,6 @@ Outputs:
     Value: !GetAtt ApplicationLoadBalancer.DNSName
     Export:
       Name: !Sub ${AWS::StackName}-ApplicationLoadBalancerDnsName
-
-  ApplicationLoadBalancerBaseDnsName:
-    Value: !GetAtt ApplicationLoadBalancer.DNSName
-    Export:
-      Name: !Sub ${AWS::StackName}-ApplicationLoadBalancerBaseDnsName
 
   ApplicationLoadBalancerCanonicalHostedZoneId:
     Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
